@@ -911,6 +911,7 @@ type SessionAffinitySelector struct {
 	cache            *SessionCache
 	matcher          *cliproxysession.MerklePrefixMatcher
 	subagentAffinity bool
+	priorityFailback bool
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -918,6 +919,7 @@ type SessionAffinityConfig struct {
 	Fallback         Selector
 	TTL              time.Duration
 	SubagentAffinity *bool
+	PriorityFailback bool
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -945,6 +947,7 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		cache:            NewSessionCache(cfg.TTL),
 		matcher:          cliproxysession.NewMerklePrefixMatcher(cfg.TTL),
 		subagentAffinity: subagentAffinity,
+		priorityFailback: cfg.PriorityFailback,
 	}
 }
 
@@ -959,10 +962,10 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
 // are absolute authority. Requests without those signals use the Merkle LCP
 // matcher before retaining the legacy derived/hash fallback behavior.
 //
-// An established binding outranks credential priority: a bound credential that is still
-// available is reused even when a higher-priority credential recovers. Credential priority
-// applies to cold bindings, requests without a session, and genuine bound-credential
-// failover, so the fallback selector only ever receives the highest available priority tier.
+// By default, an established binding outranks credential priority: a bound credential that
+// is still available is reused even when a higher-priority credential recovers. When priority
+// failback is enabled, a recovered higher-priority tier preempts a lower-priority binding.
+// The fallback selector only ever receives the highest available priority tier.
 //
 // Note: The cache key includes provider, session ID, and model to handle cases where
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
@@ -1050,10 +1053,34 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			s.cache.Set(cacheKey, authID)
 		}
 	}
+	rebindHigherPriority := func(cached *Auth) (*Auth, bool, error) {
+		if !s.shouldPriorityFailback(cached, fallbackAuths) {
+			return nil, false, nil
+		}
+		selected, errPick := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		if errPick != nil {
+			return nil, true, errPick
+		}
+		if selected == nil {
+			return nil, true, nil
+		}
+		bind(selected.ID)
+		return selected, true, nil
+	}
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
+				if selected, rebound, errPick := rebindHigherPriority(auth); rebound {
+					if errPick != nil {
+						return nil, errPick
+					}
+					if selected == nil {
+						return nil, nil
+					}
+					entry.Infof("session-affinity: higher-priority auth available, rebound | session=%s previous_auth=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, selected.ID, provider, model)
+					return selected, nil
+				}
 				bind(auth.ID)
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
@@ -1077,6 +1104,16 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
 					if !isSubagent || s.subagentAffinity {
+						if selected, rebound, errPick := rebindHigherPriority(auth); rebound {
+							if errPick != nil {
+								return nil, errPick
+							}
+							if selected == nil {
+								return nil, nil
+							}
+							entry.Infof("session-affinity: higher-priority auth available, rebound | session=%s fallback=%s previous_auth=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, selected.ID, provider, model)
+							return selected, nil
+						}
 						bind(auth.ID)
 						if isFork {
 							entry.Infof("session-affinity: fork cache hit | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
@@ -1104,6 +1141,10 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	}
 	return auth, nil
+}
+
+func (s *SessionAffinitySelector) shouldPriorityFailback(cached *Auth, fallbackAuths []*Auth) bool {
+	return s.priorityFailback && len(fallbackAuths) > 0 && authPriority(fallbackAuths[0]) > authPriority(cached)
 }
 
 func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, entry *log.Entry) (*Auth, bool, error) {
