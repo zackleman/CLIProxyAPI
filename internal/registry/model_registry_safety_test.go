@@ -196,3 +196,19 @@ func TestLookupModelInfoIncludesClaudeSonnet5(t *testing.T) {
 		}
 	}
 }
+
+func TestLookupModelInfoIncludesClaudeFable51(t *testing.T) {
+	model := LookupModelInfo("claude-fable-5-1")
+	if model == nil {
+		t.Fatal("expected Claude Fable 5.1 static model")
+	}
+	if model.Type != "claude" {
+		t.Fatalf("Claude Fable 5.1 type = %q, want claude", model.Type)
+	}
+	if model.ContextLength != 1000000 {
+		t.Fatalf("Claude Fable 5.1 context length = %d, want 1000000", model.ContextLength)
+	}
+	if model.MaxCompletionTokens != 128000 {
+		t.Fatalf("Claude Fable 5.1 max completion tokens = %d, want 128000", model.MaxCompletionTokens)
+	}
+}
