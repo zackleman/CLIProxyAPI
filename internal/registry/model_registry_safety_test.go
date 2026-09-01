@@ -212,3 +212,13 @@ func TestLookupModelInfoIncludesClaudeFable51(t *testing.T) {
 		t.Fatalf("Claude Fable 5.1 max completion tokens = %d, want 128000", model.MaxCompletionTokens)
 	}
 }
+
+func TestClaudeFable51SurvivesRemoteCatalogLag(t *testing.T) {
+	models := WithClaudeBuiltins([]*ModelInfo{{ID: "claude-fable-5", Type: "claude"}})
+	for _, model := range models {
+		if model != nil && model.ID == "claude-fable-5-1" {
+			return
+		}
+	}
+	t.Fatal("expected Claude Fable 5.1 built-in when the remote catalog omits it")
+}
