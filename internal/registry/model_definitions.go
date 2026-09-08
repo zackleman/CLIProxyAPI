@@ -7,7 +7,6 @@ import (
 )
 
 const (
-	claudeBuiltinFable51ModelID   = "claude-fable-5-1"
 	codexBuiltinImage15ModelID    = "gpt-image-1.5"
 	codexBuiltinImageModelID      = "gpt-image-2"
 	xaiBuiltinImageModelID        = "grok-imagine-image"
@@ -35,7 +34,7 @@ type staticModelsJSON struct {
 
 // GetClaudeModels returns the standard Claude model definitions.
 func GetClaudeModels() []*ModelInfo {
-	return WithClaudeBuiltins(cloneModelInfos(getModels().Claude))
+	return cloneModelInfos(getModels().Claude)
 }
 
 // GetGeminiModels returns the standard Gemini model definitions.
@@ -118,34 +117,6 @@ func GetXAIModels() []*ModelInfo {
 // already present in the provided slice.
 func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 	return upsertModelInfos(models, codexBuiltinImage15ModelInfo(), codexBuiltinImageModelInfo())
-}
-
-// WithClaudeBuiltins injects models that must remain available even when the
-// remotely refreshed catalog has not caught up to a Claude release.
-func WithClaudeBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, claudeBuiltinFable51ModelInfo())
-}
-
-func claudeBuiltinFable51ModelInfo() *ModelInfo {
-	return &ModelInfo{
-		ID:                        claudeBuiltinFable51ModelID,
-		Object:                    "model",
-		Created:                   1788220800, // 2026-09-01
-		OwnedBy:                   "anthropic",
-		Type:                      "claude",
-		DisplayName:               "Claude Fable 5.1",
-		Description:               "Anthropic's frontier model for demanding reasoning and long-horizon agentic work",
-		ContextLength:             1_000_000,
-		MaxCompletionTokens:       128_000,
-		SupportedInputModalities:  []string{"text", "image"},
-		SupportedOutputModalities: []string{"text"},
-		Thinking: &ThinkingSupport{
-			Min:         1024,
-			Max:         128_000,
-			ZeroAllowed: true,
-			Levels:      []string{"low", "medium", "high", "xhigh", "max"},
-		},
-	}
 }
 
 // WithXAIBuiltins injects hard-coded xAI image/video model definitions that should
@@ -370,7 +341,7 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 
 	data := getModels()
 	allModels := [][]*ModelInfo{
-		WithClaudeBuiltins(cloneModelInfos(data.Claude)),
+		data.Claude,
 		data.Gemini,
 		data.Vertex,
 		data.AIStudio,
