@@ -186,11 +186,19 @@ func rotateWithinGroup(group []*Auth, lastID string) *Auth {
 // prepareQuotaAwarePick reports the quota-routing rule family for this pick
 // and whether availability must span all priority tiers (Fable ordering is a
 // strict primary key, so it cannot work on the top tier alone).
+//
+// The provider gate additionally accepts "mixed": the legacy multi-provider
+// path invokes the selector with the combined candidate pool under that key,
+// and the rules are still model-shaped (probe state only ever exists on
+// Claude credentials, so non-Claude candidates sort as unknown and stay
+// reachable as failback).
 func prepareQuotaAwarePick(ctx context.Context, provider, model string) (family string, acrossPriorities bool) {
 	if !quotaAwareRoutingEnabled(ctx) {
 		return "", false
 	}
-	if !strings.EqualFold(strings.TrimSpace(provider), "claude") {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude", "mixed":
+	default:
 		return "", false
 	}
 	family = claudeQuotaRoutingFamily(canonicalModelKey(model))

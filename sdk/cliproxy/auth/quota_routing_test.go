@@ -167,6 +167,42 @@ func TestRoundRobinSelectorQuotaAwareFableNonFableModelUntouched(t *testing.T) {
 	}
 }
 
+// The legacy multi-provider selection path invokes selectors with provider
+// "mixed"; quota rules must still apply there (nucbox deploys several Bedrock
+// bridge credentials and session-affinity, so the live path is mixed).
+func TestRoundRobinSelectorQuotaAwareMixedProvider(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	fresh := now.Add(-5 * time.Minute)
+
+	auths := []*Auth{
+		claudeAuthWithFableProbe("claude-healthy", 0, ptrFloat(31), now.Add(24*time.Hour), fresh),
+		claudeAuthWithFableProbe("claude-spent", 0, ptrFloat(100), now.Add(48*time.Hour), fresh),
+		{ID: "bedrock-fallback", Provider: "claude", Status: StatusActive, Attributes: map[string]string{"priority": "-10"}},
+	}
+	selector := &RoundRobinSelector{}
+	ctx := withQuotaAwareRouting(context.Background())
+
+	// Fable through "mixed": soonest-reset credential wins, the unprobed
+	// Bedrock failback stays reachable but sorts last.
+	picked, err := selector.Pick(ctx, "mixed", "claude-fable-5-1", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if picked.ID != "claude-healthy" {
+		t.Fatalf("mixed Fable pick = %s, want claude-healthy", picked.ID)
+	}
+
+	// Opus through "mixed": Fable-exhausted credentials are preferred.
+	picked, err = selector.Pick(ctx, "mixed", "claude-opus-5", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if picked.ID != "claude-spent" {
+		t.Fatalf("mixed Opus pick = %s, want claude-spent", picked.ID)
+	}
+}
+
 func TestRoundRobinSelectorQuotaAwareOpus(t *testing.T) {
 	t.Parallel()
 	now := time.Now()
