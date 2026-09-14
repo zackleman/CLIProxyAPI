@@ -97,17 +97,7 @@ func parseCodexWhamUsageProbe(body []byte, now time.Time) *QuotaProbe {
 	if !rateLimits.Exists() {
 		rateLimits = root.Get("rate_limits")
 	}
-	for _, bucket := range []struct {
-		key  string
-		name string
-	}{
-		{"primary", QuotaWindowCodexPrimary},
-		{"secondary", QuotaWindowCodexSecondary},
-	} {
-		if window, ok := parseUsageWindow(rateLimits.Get(bucket.key), now); ok {
-			probe.Windows[bucket.name] = window
-		}
-	}
+	addCodexWindows(rateLimits, "", probe, now)
 	additional := root.Get("additional_rate_limits")
 	if additional.IsArray() {
 		additional.ForEach(func(_, entry gjson.Result) bool {
@@ -115,12 +105,8 @@ func parseCodexWhamUsageProbe(body []byte, now time.Time) *QuotaProbe {
 			if limitName == "" {
 				limitName = strings.TrimSpace(entry.Get("metered_feature").String())
 			}
-			window, ok := parseUsageWindow(entry.Get("rate_limit"), now)
-			if !ok {
-				window, ok = parseUsageWindow(entry, now)
-			}
-			if ok && limitName != "" {
-				probe.Windows[QuotaWindowCodexAdditionalPrefix+strings.ToLower(limitName)] = window
+			if limitName != "" {
+				addCodexWindows(entry.Get("rate_limit"), QuotaWindowCodexAdditionalPrefix+strings.ToLower(limitName)+":", probe, now)
 			}
 			return true
 		})
@@ -129,6 +115,26 @@ func parseCodexWhamUsageProbe(body []byte, now time.Time) *QuotaProbe {
 		return nil
 	}
 	return probe
+}
+
+// addCodexWindows extracts the primary/secondary windows from a Codex
+// rate_limit object. Live payloads use primary_window / secondary_window; the
+// bare spellings are kept for the header-flat variants.
+func addCodexWindows(rateLimits gjson.Result, prefix string, probe *QuotaProbe, now time.Time) {
+	for _, bucket := range []struct {
+		keys []string
+		name string
+	}{
+		{[]string{"primary_window", "primary"}, prefix + QuotaWindowCodexPrimary},
+		{[]string{"secondary_window", "secondary"}, prefix + QuotaWindowCodexSecondary},
+	} {
+		for _, key := range bucket.keys {
+			if window, ok := parseUsageWindow(rateLimits.Get(key), now); ok {
+				probe.Windows[bucket.name] = window
+				break
+			}
+		}
+	}
 }
 
 // parseUsageWindow extracts percent/reset from the widely varying upstream
