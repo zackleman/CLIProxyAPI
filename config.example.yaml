@@ -274,6 +274,14 @@ codex:
   # normalizes encrypted agent_message content for Codex, and converts agent_message input
   # into standard user messages for non-Codex upstream protocols.
   optimize-multi-agent-v2: false
+  # Decouple the upstream WebSocket transport from the client transport: credentials
+  # whose auth config enables "websockets" then talk to chatgpt.com over a persistent
+  # WebSocket even for HTTP/SSE clients (Codex CLI), saving TCP+TLS+handshake setup per
+  # turn. Requires per-credential websockets: true. Connect failures retry the request
+  # once over HTTP and cool the WebSocket path on that credential for 5 minutes;
+  # mid-stream failures fail the request rather than silently replaying partial output.
+  # Default: false
+  upstream-websockets: false
   # When true, enable opt-in compatibility for orphan Codex delegation outputs.
   # Converts orphan function_call_output items from codex_app/create_thread and
   # codex_app/send_message_to_thread (which lack a valid call_id or matching function_call)

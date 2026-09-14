@@ -146,6 +146,15 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if respHS != nil {
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
+		// Decoupled mode: a connect/handshake failure falls back to one HTTP
+		// attempt and cools the credential's websocket path, per the plan's
+		// failure semantics. Mid-stream failures never take this branch.
+		if codexDecoupledShouldFallbackWS(ctx, opts, respHS) {
+			closeHTTPResponseBody(respHS, "codex websockets executor: close handshake response body error")
+			log.Warnf("codex websockets executor: decoupled dial failed for auth %s (%v); retrying over HTTP and cooling websocket path for %s", authID, errDial, codexUpstreamWebsocketCooldown)
+			unlockSession()
+			return e.codexDecoupledHTTPFallbackExecute(ctx, auth, req, opts)
+		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
 			if opts.ExecutionLifecycle == nil && !cliproxyexecutor.DownstreamWebsocket(ctx) {
 				return e.CodexExecutor.Execute(ctx, auth, req, opts)
@@ -209,6 +218,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 			if !shouldRetryCodexWebsocketSend(errSend) {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
+				if codexDecoupledShouldFallbackWS(ctx, opts, nil) {
+					return e.codexDecoupledHTTPFallbackExecute(ctx, auth, req, opts)
+				}
 				return resp, errSend
 			}
 
@@ -249,15 +261,24 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 					errSendRetry = mapCodexWebsocketWriteError(sess, connRetry, errSendRetry)
 					e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
 					helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
+					if codexDecoupledShouldFallbackWS(ctx, opts, nil) {
+						return e.codexDecoupledHTTPFallbackExecute(ctx, auth, req, opts)
+					}
 					return resp, errSendRetry
 				}
 			} else {
 				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
+				if codexDecoupledShouldFallbackWS(ctx, opts, respHSRetry) {
+					return e.codexDecoupledHTTPFallbackExecute(ctx, auth, req, opts)
+				}
 				return resp, errDialRetry
 			}
 		} else {
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
+			if codexDecoupledShouldFallbackWS(ctx, opts, nil) {
+				return e.codexDecoupledHTTPFallbackExecute(ctx, auth, req, opts)
+			}
 			return resp, errSend
 		}
 	}

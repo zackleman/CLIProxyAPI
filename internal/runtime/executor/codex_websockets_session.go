@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -48,6 +49,11 @@ func (c *websocketConnectionCloser) Close() error {
 
 type codexWebsocketSession struct {
 	sessionID string
+
+	// lastUsedUnix tracks the last request activity for lazy eviction:
+	// downstream WS sessions are closed by the websocket handler, but decoupled
+	// (HTTP client) sessions have no such lifecycle and must self-expire.
+	lastUsedUnix atomic.Int64
 
 	reqMu sync.Mutex
 
@@ -109,6 +115,7 @@ func (s *codexWebsocketSession) activate(conn *websocket.Conn) chan codexWebsock
 	if s == nil || conn == nil {
 		return nil
 	}
+	s.lastUsedUnix.Store(time.Now().Unix())
 	ch := make(chan codexWebsocketRead, 4096)
 	s.setActive(conn, ch)
 	return ch
@@ -134,6 +141,9 @@ func clearRetryActiveState(sess *codexWebsocketSession, conn *websocket.Conn, ch
 }
 
 func (s *codexWebsocketSession) clearActive(conn *websocket.Conn, ch chan codexWebsocketRead) bool {
+	if s != nil {
+		s.lastUsedUnix.Store(time.Now().Unix())
+	}
 	if s == nil {
 		return false
 	}
@@ -446,6 +456,11 @@ func executionSessionIDFromOptions(opts cliproxyexecutor.Options) string {
 	}
 }
 
+// codexWebsocketSessionIdleTTL bounds how long a session with no request
+// activity stays in the store. Connections already die on their own idle
+// timeout; this only garbage-collects the bookkeeping entry.
+const codexWebsocketSessionIdleTTL = 30 * time.Minute
+
 func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWebsocketSession {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
@@ -458,18 +473,27 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 	if store == nil {
 		store = globalCodexWebsocketSessionStore
 	}
+	now := time.Now()
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.sessions == nil {
 		store.sessions = make(map[string]*codexWebsocketSession)
 	}
 	if sess, ok := store.sessions[sessionID]; ok && sess != nil {
-		return sess
+		lastUsed := time.Unix(sess.lastUsedUnix.Load(), 0)
+		if !lastUsed.IsZero() && now.Sub(lastUsed) > codexWebsocketSessionIdleTTL {
+			delete(store.sessions, sessionID)
+			go closeCodexWebsocketSession(sess, "idle_expired")
+		} else {
+			sess.lastUsedUnix.Store(now.Unix())
+			return sess
+		}
 	}
 	sess := &codexWebsocketSession{
 		sessionID:            sessionID,
 		upstreamDisconnectCh: make(chan error, 1),
 	}
+	sess.lastUsedUnix.Store(now.Unix())
 	store.sessions[sessionID] = sess
 	return sess
 }

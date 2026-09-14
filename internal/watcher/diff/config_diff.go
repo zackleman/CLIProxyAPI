@@ -146,6 +146,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Codex.StreamBootstrapBuffering != newCfg.Codex.StreamBootstrapBuffering {
 		changes = append(changes, fmt.Sprintf("codex.stream-bootstrap-buffering: %t -> %t", oldCfg.Codex.StreamBootstrapBuffering, newCfg.Codex.StreamBootstrapBuffering))
 	}
+	if oldCfg.Codex.UpstreamWebsockets != newCfg.Codex.UpstreamWebsockets {
+		changes = append(changes, fmt.Sprintf("codex.upstream-websockets: %t -> %t", oldCfg.Codex.UpstreamWebsockets, newCfg.Codex.UpstreamWebsockets))
+	}
 	if oldCfg.Codex.OptimizeMultiAgentV2 != newCfg.Codex.OptimizeMultiAgentV2 {
 		changes = append(changes, fmt.Sprintf("codex.optimize-multi-agent-v2: %t -> %t", oldCfg.Codex.OptimizeMultiAgentV2, newCfg.Codex.OptimizeMultiAgentV2))
 	}

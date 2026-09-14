@@ -148,6 +148,17 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		if respHS != nil {
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
+		// Decoupled mode: connect/handshake failure retries once over HTTP and
+		// cools the credential's websocket path. Read-side failures further down
+		// (after the request reached upstream) never fall back.
+		if codexDecoupledShouldFallbackWS(ctx, opts, respHS) {
+			if sess != nil {
+				sess.reqMu.Unlock()
+			}
+			closeHTTPResponseBody(respHS, "codex websockets executor: close handshake response body error")
+			log.Warnf("codex websockets executor: decoupled dial failed for auth %s (%v); retrying over HTTP and cooling websocket path for %s", authID, errDial, codexUpstreamWebsocketCooldown)
+			return e.codexDecoupledHTTPFallbackStream(ctx, auth, req, opts)
+		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
 			if sess != nil {
 				sess.reqMu.Unlock()
@@ -213,6 +224,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if !shouldRetryCodexWebsocketSend(errSend) {
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
+				if codexDecoupledShouldFallbackWS(ctx, opts, nil) {
+					return e.codexDecoupledHTTPFallbackStream(ctx, auth, req, opts)
+				}
 				return nil, errSend
 			}
 
@@ -223,6 +237,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
+				if codexDecoupledShouldFallbackWS(ctx, opts, respHSRetry) {
+					return e.codexDecoupledHTTPFallbackStream(ctx, auth, req, opts)
+				}
 				return nil, errDialRetry
 			}
 			previousConn, previousReadCh := conn, readCh
@@ -257,6 +274,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				e.invalidateUpstreamConn(sess, conn, "send_error", errSendRetry)
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
+				if codexDecoupledShouldFallbackWS(ctx, opts, nil) {
+					return e.codexDecoupledHTTPFallbackStream(ctx, auth, req, opts)
+				}
 				return nil, errSendRetry
 			}
 			wsReqBody = wsReqBodyRetry
@@ -264,6 +284,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			logCodexWebsocketDisconnected(executionSessionID, authID, wsURL, "send_error", errSend)
 			if errClose := closer.Close(); errClose != nil {
 				log.Errorf("codex websockets executor: close websocket error: %v", errClose)
+			}
+			if codexDecoupledShouldFallbackWS(ctx, opts, nil) {
+				return e.codexDecoupledHTTPFallbackStream(ctx, auth, req, opts)
 			}
 			return nil, errSend
 		}

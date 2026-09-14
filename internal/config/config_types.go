@@ -180,6 +180,13 @@ type CodexConfig struct {
 	OrphanDelegationCompatibility bool `yaml:"orphan-delegation-compatibility" json:"orphan-delegation-compatibility"`
 	// LiveMediaRelay terminates and relays Codex Live WebRTC media in this process.
 	LiveMediaRelay CodexLiveMediaRelayConfig `yaml:"live-media-relay" json:"live-media-relay"`
+	// UpstreamWebsockets decouples the upstream WebSocket transport from the client
+	// transport: when true, credentials with websockets enabled (the per-credential
+	// "websockets" attribute) talk to chatgpt.com over a persistent WebSocket even for
+	// HTTP/SSE clients. Connect failures retry once over HTTP and cool the WebSocket
+	// path on that credential for 5 minutes; mid-stream failures are surfaced, never
+	// silently replayed. Default: false.
+	UpstreamWebsockets bool `yaml:"upstream-websockets" json:"upstream-websockets"`
 }
 
 // CodexLiveMediaRelayConfig configures the in-process Codex Live WebRTC gateway.

@@ -249,8 +249,8 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 		if !forceReplace {
 			existingExecutor, hasExecutor := s.coreManager.Executor("codex")
 			if hasExecutor {
-				_, isCodexAutoExecutor := existingExecutor.(*executor.CodexAutoExecutor)
-				if isCodexAutoExecutor {
+				existingCodexAutoExecutor, isCodexAutoExecutor := existingExecutor.(*executor.CodexAutoExecutor)
+				if isCodexAutoExecutor && existingCodexAutoExecutor.UsesConfig(cfg) {
 					return
 				}
 			}
