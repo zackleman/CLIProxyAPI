@@ -52,6 +52,23 @@ sorted head group instead of a full weighted sort; the per-auth sidecar
 extension is `.quota` (not `.quota.json`, which the auth-file watcher and token
 store would misread).
 
+### Live verification (2026-09-13, nucbox accounts, read-only curls)
+
+- Claude `GET api.anthropic.com/api/oauth/usage` with plain
+  `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20` → HTTP 200 on
+  all 3 OAuth accounts; `limits[]` carries
+  `{"kind":"weekly_scoped","scope":{"model":{"display_name":"Fable"}},percent,resets_at,is_active}`.
+  Actual state: z2@jarmin.ai **31%** (resets 09-16), zack@jarmin.ai **100%**
+  (resets 09-17 12:00Z), z@jarmin.ai **100%** (resets 09-17 20:00Z) — exactly
+  the account skew this routing exists for. Regression test added from a
+  reduced copy of this payload.
+- Codex `GET chatgpt.com/backend-api/wham/usage` → HTTP 200; shape is
+  `rate_limit.primary_window` / `secondary_window` (not `primary`/`secondary`)
+  with `used_percent`, `reset_after_seconds`, `reset_at` (unix); additional
+  limits nest the same struct under `additional_rate_limits[].rate_limit`.
+  Parser updated accordingly; live-shape fixture added. A stale (2026-07)
+  Codex access token → 401, handled by the poller's refresh-then-poll.
+
 ### Rules (approved)
 
 1. **Fable reset-soonest.** For requests routed to any `claude-fable-*` model:
