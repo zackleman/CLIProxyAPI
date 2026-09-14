@@ -188,6 +188,10 @@ type QuotaState struct {
 	// Cooldown transitions must use applyCooldownFields so they cannot replace
 	// this snapshot.
 	Signals map[string]string `json:"signals,omitempty"`
+	// Probe stores the snapshot from proactive server-side quota polling
+	// (quota-aware-routing). Cooldown persistence intentionally does not copy
+	// it; probes have their own .quota sidecar persistence.
+	Probe *QuotaProbe `json:"probe,omitempty"`
 }
 
 // Clone returns an independent copy of the quota state.
@@ -199,6 +203,7 @@ func (q QuotaState) Clone() QuotaState {
 			copyQuota.Signals[key] = value
 		}
 	}
+	copyQuota.Probe = q.Probe.clone()
 	return copyQuota
 }
 

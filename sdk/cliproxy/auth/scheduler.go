@@ -76,6 +76,9 @@ type modelScheduler struct {
 	priorityOrder   []int
 	readyByPriority map[int]*readyBucket
 	blocked         cooldownQueue
+	// quotaLastPicked tracks rotation within the quota-sorted head group for
+	// quota-aware-routing (claude-fable-*), independent of per-bucket cursors.
+	quotaLastPicked string
 }
 
 // scheduledAuth stores the runtime scheduling state for a single auth inside a model shard.
@@ -326,8 +329,11 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin)
-	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
+	if picked := shard.pickReadyLocked(ctx, preferWebsocket, strategy, predicate); picked != nil {
 		return picked, nil
+	}
+	if errQuota := shard.quotaAwareExhaustedErrorLocked(ctx, provider, model, predicate); errQuota != nil {
+		return nil, errQuota
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
 }
@@ -387,7 +393,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		}
 		shard := providerState.ensureModelLocked(modelKey, time.Now())
 		predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin)
-		if picked := shard.pickReadyLocked(false, strategy, predicate); picked != nil {
+		if picked := shard.pickReadyLocked(ctx, false, strategy, predicate); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -427,7 +433,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate)
+			picked := shard.pickReadyAtPriorityLocked(ctx, false, bestPriority, strategy, predicate)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -517,7 +523,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		if shard == nil {
 			continue
 		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate)
+		picked := shard.pickReadyAtPriorityLocked(ctx, false, bestPriority, schedulerStrategyRoundRobin, predicate)
 		if picked == nil {
 			continue
 		}
@@ -1139,16 +1145,111 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 }
 
 // pickReadyLocked selects the next ready auth from the highest available priority bucket.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyLocked(ctx context.Context, preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
-	m.promoteExpiredLocked(time.Now())
+	now := time.Now()
+	m.promoteExpiredLocked(now)
+	// Quota-aware Fable ordering is a strict primary key across priorities, so
+	// it bypasses the per-bucket pick entirely. A nil result with excluded
+	// credentials is reported by quotaAwareExhaustedErrorLocked at the caller.
+	if quotaAwareRoutingEnabled(ctx) && m.claudeProviderLocked() && claudeQuotaRoutingFamily(m.modelKey) == "fable" {
+		return m.pickQuotaAwareFableLocked(now, predicate)
+	}
 	priorityReady, okPriority := m.highestReadyPriorityLocked(preferWebsocket, predicate)
 	if !okPriority {
 		return nil
 	}
-	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
+	return m.pickReadyAtPriorityLocked(ctx, preferWebsocket, priorityReady, strategy, predicate)
+}
+
+// claudeProviderLocked reports whether the shard serves Claude credentials.
+func (m *modelScheduler) claudeProviderLocked() bool {
+	for _, entry := range m.entries {
+		if entry != nil && entry.auth != nil {
+			return strings.EqualFold(strings.TrimSpace(entry.auth.Provider), "claude")
+		}
+	}
+	return false
+}
+
+// pickQuotaAwareFableLocked applies the Fable reset-soonest ordering across
+// all priority tiers: filter out credentials whose weekly Fable quota is
+// exhausted, order by soonest reset (unknown last, weekly recurrence
+// projected), rotate within the head group.
+func (m *modelScheduler) pickQuotaAwareFableLocked(now time.Time, predicate func(*scheduledAuth) bool) *Auth {
+	if m == nil {
+		return nil
+	}
+	candidates := make([]*Auth, 0, 4)
+	for _, priority := range m.priorityOrder {
+		bucket := m.readyByPriority[priority]
+		if bucket == nil {
+			continue
+		}
+		for _, entry := range bucket.all.flat {
+			if entry == nil || entry.auth == nil || (predicate != nil && !predicate(entry)) {
+				continue
+			}
+			candidates = append(candidates, entry.auth)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	ordered, allExcluded, _ := quotaAwareOrderForFable(candidates, now)
+	if allExcluded || len(ordered) == 0 {
+		return nil
+	}
+	picked := rotateWithinGroup(quotaFableHeadGroup(ordered, now), m.quotaLastPicked)
+	if picked != nil {
+		m.quotaLastPicked = picked.ID
+	}
+	return picked
+}
+
+// quotaAwareExhaustedErrorLocked reports the 429 + Retry-After error for a
+// Fable request whose remaining credentials all have their weekly Fable quota
+// exhausted, so the client gets a reset hint without a wasted upstream call.
+// Returns nil when quota-aware routing does not apply or some credential can
+// still serve the request.
+func (m *modelScheduler) quotaAwareExhaustedErrorLocked(ctx context.Context, provider, model string, predicate func(*scheduledAuth) bool) error {
+	if m == nil {
+		return nil
+	}
+	if !quotaAwareRoutingEnabled(ctx) || !m.claudeProviderLocked() || claudeQuotaRoutingFamily(canonicalModelKey(model)) != "fable" {
+		return nil
+	}
+	now := time.Now()
+	candidates := make([]*Auth, 0, 4)
+	for _, priority := range m.priorityOrder {
+		bucket := m.readyByPriority[priority]
+		if bucket == nil {
+			continue
+		}
+		for _, entry := range bucket.all.flat {
+			if entry == nil || entry.auth == nil || (predicate != nil && !predicate(entry)) {
+				continue
+			}
+			candidates = append(candidates, entry.auth)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	_, allExcluded, soonest := quotaAwareOrderForFable(candidates, now)
+	if !allExcluded {
+		return nil
+	}
+	if soonest.IsZero() {
+		return &Error{Code: "auth_unavailable", Message: "all Claude credentials have their weekly Fable quota exhausted"}
+	}
+	resetIn := soonest.Sub(now)
+	if resetIn < 0 {
+		resetIn = 0
+	}
+	return newModelCooldownError(model, provider, resetIn)
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.
@@ -1184,7 +1285,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 
 // pickReadyAtPriorityLocked selects the next ready auth from a specific priority bucket.
 // The caller must ensure expired entries are already promoted when needed.
-func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyAtPriorityLocked(ctx context.Context, preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -1195,6 +1296,19 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	view := &bucket.all
 	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
 		view = &bucket.ws
+	}
+	// Quota-aware Opus rule: within the picked view, prefer credentials whose
+	// weekly Fable quota is exhausted (that quota is otherwise unusable), while
+	// keeping the configured strategy's cursor semantics on the narrowed set.
+	originalView := view
+	pickedSubView := false
+	if quotaAwareRoutingEnabled(ctx) && m.claudeProviderLocked() && claudeQuotaRoutingFamily(m.modelKey) == "opus" {
+		if narrowed := narrowViewToFableExhausted(view, predicate, time.Now()); narrowed != nil {
+			sub := *view
+			sub.flat = narrowed
+			view = &sub
+			pickedSubView = true
+		}
 	}
 	var picked *scheduledAuth
 	switch strategy {
@@ -1208,7 +1322,34 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	if picked == nil || picked.auth == nil {
 		return nil
 	}
+	if pickedSubView {
+		// Weighted-state maps are shared by the shallow copy; only the
+		// round-trip cursor needs the write-back.
+		originalView.lastPicked = view.lastPicked
+	}
 	return picked.auth
+}
+
+// narrowViewToFableExhausted returns the view's eligible entries restricted to
+// credentials with an exhausted weekly Fable quota, or nil when no such
+// credential exists (caller keeps the full view).
+func narrowViewToFableExhausted(view *readyView, predicate func(*scheduledAuth) bool, now time.Time) []*scheduledAuth {
+	if view == nil {
+		return nil
+	}
+	var narrowed []*scheduledAuth
+	for _, entry := range view.flat {
+		if entry == nil || entry.auth == nil || (predicate != nil && !predicate(entry)) {
+			continue
+		}
+		if entry.auth.Quota.claudeFableExhausted(now) {
+			narrowed = append(narrowed, entry)
+		}
+	}
+	if len(narrowed) == 0 {
+		return nil
+	}
+	return narrowed
 }
 
 func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int, predicate func(*scheduledAuth) bool) int {

@@ -68,6 +68,12 @@ type Config struct {
 	// SaveCooldownStatus persists runtime cooldown status next to auth files when true.
 	SaveCooldownStatus bool `yaml:"save-cooldown-status" json:"save-cooldown-status"`
 
+	// QuotaAwareRouting enables proactive upstream quota polling and Claude
+	// Fable/Opus account prioritization. Fable requests prefer the credential
+	// whose weekly Fable quota resets soonest; Opus requests prefer credentials
+	// whose Fable weekly quota is exhausted. Default: false.
+	QuotaAwareRouting bool `yaml:"quota-aware-routing" json:"quota-aware-routing"`
+
 	// TransientErrorCooldownSeconds controls cooldowns for transient upstream errors.
 	// 0 keeps the legacy default cooldown. Negative values disable these cooldowns.
 	TransientErrorCooldownSeconds int `yaml:"transient-error-cooldown-seconds" json:"transient-error-cooldown-seconds"`

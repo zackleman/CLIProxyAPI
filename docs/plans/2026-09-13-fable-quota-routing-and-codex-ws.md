@@ -41,6 +41,17 @@ Facts established by exploring the fork:
 
 ## Feature 1: quota-aware account prioritization
 
+Status: **implemented** on branch `codex/fable-quota-aware-routing`
+(worktree `~/Projects/oss/CLIProxyAPI-quota-routing`):
+`quota_probe.go` / `quota_probe_parse.go` / `quota_probe_store.go` /
+`quota_poller.go` / `quota_routing.go` + selector/scheduler wiring, config flag
+`quota-aware-routing` (default off), poller started from the service lifecycle
+and force-refreshed from `MarkResult` on any quota-class 429 (claude/codex).
+Deviations for simplicity: weighted round-robin rotates weightedly within the
+sorted head group instead of a full weighted sort; the per-auth sidecar
+extension is `.quota` (not `.quota.json`, which the auth-file watcher and token
+store would misread).
+
 ### Rules (approved)
 
 1. **Fable reset-soonest.** For requests routed to any `claude-fable-*` model:

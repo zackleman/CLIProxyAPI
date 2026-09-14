@@ -172,6 +172,15 @@ disable-cooling: false
 # Default is false; when false, cooldown status is kept in memory only.
 save-cooldown-status: false
 
+# When true, proactively poll upstream usage endpoints (Claude /api/oauth/usage,
+# Codex /wham/usage) every 10 minutes per OAuth credential and use the data for
+# selection: claude-fable-* requests prefer the credential whose weekly Fable
+# quota resets soonest; claude-opus-* requests prefer credentials whose weekly
+# Fable quota is exhausted. Learned reset times are persisted as .quota sidecar
+# files next to auth files.
+# Default: false.
+quota-aware-routing: false
+
 # Cooldown duration in seconds for transient upstream errors (408/500/502/503/504).
 # Set to 0 to keep the legacy 60-second cooldown; set to -1 to disable transient error cooldowns.
 transient-error-cooldown-seconds: 0

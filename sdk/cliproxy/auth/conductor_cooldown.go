@@ -739,6 +739,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	var authSnapshot *Auth
 	cooldownStateChanged := false
+	quotaProbeForced := false
 	now := time.Now()
 
 	m.mu.Lock()
@@ -944,6 +945,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
+		// Quota-aware routing: a quota-class failure triggers an immediate
+		// upstream usage probe for the credential so its reset time and
+		// utilisation get learned without waiting for the next scheduled poll.
+		if !result.Success && result.Error != nil && result.Error.StatusCode() == http.StatusTooManyRequests {
+			switch strings.ToLower(strings.TrimSpace(result.Provider)) {
+			case "claude", "codex":
+				quotaProbeForced = true
+			}
+		}
+
 		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
@@ -952,6 +963,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 	}
 	m.mu.Unlock()
+	if quotaProbeForced {
+		m.queueQuotaProbeRefresh(result.AuthID)
+	}
 	if m.scheduler != nil && authSnapshot != nil {
 		var targetModels []string
 		if !result.CredentialScope && modelKey != "" {

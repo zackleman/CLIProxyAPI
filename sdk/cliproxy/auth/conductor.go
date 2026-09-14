@@ -164,6 +164,11 @@ type Manager struct {
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
 
+	// Quota poller state (quota-aware-routing). Started conditionally from the
+	// service lifecycle; no-ops unless the runtime config enables the feature.
+	quotaPollCancel context.CancelFunc
+	quotaPollLoop   *quotaPollerLoop
+
 	requestPrepareLocks sync.Map
 	// refreshLocks serializes credential refresh per auth ID so concurrent
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.

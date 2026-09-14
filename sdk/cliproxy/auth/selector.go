@@ -614,7 +614,14 @@ func highestPriorityAuths(auths []*Auth) []*Auth {
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, now)
+	family, acrossPriorities := prepareQuotaAwarePick(ctx, provider, model)
+	var available []*Auth
+	var err error
+	if acrossPriorities {
+		available, err = getSelectorAvailableAuthsAcrossPriorities(ctx, auths, provider, model, now)
+	} else {
+		available, err = getSelectorAvailableAuths(ctx, auths, provider, model, now)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -629,8 +636,22 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	if limit <= 0 {
 		limit = 4096
 	}
-
 	s.ensureRotationKey(key, limit)
+	if family != "" {
+		candidates, handled, errAware := applyQuotaAwareCandidates(family, provider, model, available, now)
+		if errAware != nil {
+			return nil, errAware
+		}
+		if handled {
+			picked := rotateWithinGroup(quotaFableHeadGroup(candidates, now), s.lastPicked[key])
+			if picked == nil {
+				return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+			}
+			s.lastPicked[key] = picked.ID
+			return picked, nil
+		}
+		available = candidates
+	}
 	picked := available[successorIndex(available, s.lastPicked[key])]
 	s.lastPicked[key] = picked.ID
 	return picked, nil
@@ -672,11 +693,33 @@ func positiveWeightAuths(auths []*Auth) []*Auth {
 // Pick selects the next available auth using smooth weighted round-robin.
 func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
-	available, errAvailable := getSelectorAvailableAuths(ctx, positiveWeightAuths(auths), provider, model, time.Now())
+	now := time.Now()
+	family, acrossPriorities := prepareQuotaAwarePick(ctx, provider, model)
+	var available []*Auth
+	var errAvailable error
+	if acrossPriorities {
+		available, errAvailable = getSelectorAvailableAuthsAcrossPriorities(ctx, positiveWeightAuths(auths), provider, model, now)
+	} else {
+		available, errAvailable = getSelectorAvailableAuths(ctx, positiveWeightAuths(auths), provider, model, now)
+	}
 	if errAvailable != nil {
 		return nil, errAvailable
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+	if family != "" {
+		candidates, handled, errAware := applyQuotaAwareCandidates(family, provider, model, available, now)
+		if errAware != nil {
+			return nil, errAware
+		}
+		if handled {
+			// Quota-sorted Fable list: weighted rotation within the head
+			// group (equal-rotation when weights match), never descending
+			// into a later-reset tier until the head group drains.
+			available = quotaFableHeadGroup(candidates, now)
+		} else {
+			available = candidates
+		}
+	}
 	stateModel := weightedSelectorStateModel(ctx, model)
 	key := provider + ":" + canonicalModelKey(stateModel)
 
@@ -812,11 +855,25 @@ func saturatingAddInt64(value, delta int64) int64 {
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, now)
+	family, acrossPriorities := prepareQuotaAwarePick(ctx, provider, model)
+	var available []*Auth
+	var err error
+	if acrossPriorities {
+		available, err = getSelectorAvailableAuthsAcrossPriorities(ctx, auths, provider, model, now)
+	} else {
+		available, err = getSelectorAvailableAuths(ctx, auths, provider, model, now)
+	}
 	if err != nil {
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+	if family != "" {
+		candidates, _, errAware := applyQuotaAwareCandidates(family, provider, model, available, now)
+		if errAware != nil {
+			return nil, errAware
+		}
+		available = candidates
+	}
 	return available[0], nil
 }
 

@@ -49,6 +49,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.SaveCooldownStatus != newCfg.SaveCooldownStatus {
 		changes = append(changes, fmt.Sprintf("save-cooldown-status: %t -> %t", oldCfg.SaveCooldownStatus, newCfg.SaveCooldownStatus))
 	}
+	if oldCfg.QuotaAwareRouting != newCfg.QuotaAwareRouting {
+		changes = append(changes, fmt.Sprintf("quota-aware-routing: %t -> %t", oldCfg.QuotaAwareRouting, newCfg.QuotaAwareRouting))
+	}
 	if oldCfg.TransientErrorCooldownSeconds != newCfg.TransientErrorCooldownSeconds {
 		changes = append(changes, fmt.Sprintf("transient-error-cooldown-seconds: %d -> %d", oldCfg.TransientErrorCooldownSeconds, newCfg.TransientErrorCooldownSeconds))
 	}
