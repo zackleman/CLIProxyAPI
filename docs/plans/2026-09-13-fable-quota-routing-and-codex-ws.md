@@ -69,6 +69,19 @@ store would misread).
   Parser updated accordingly; live-shape fixture added. A stale (2026-07)
   Codex access token → 401, handled by the poller's refresh-then-poll.
 
+### Deployment verification (2026-09-13, nucbox)
+
+Deployed `08d3fdad` on nucbox with `quota-aware-routing: true`. Poller fetched
+all 6 healthy credentials within one jittered round, `.quota` sidecars match
+hand-verified upstream values, and probes restore across restarts
+("restored 6 persisted quota probe(s)"). Live e2e routing: a `claude-fable-5-1`
+request bound to claude-z2@jarmin.ai (31% used, soonest reset), a
+`claude-opus-5` request bound to claude-z@jarmin.ai (Fable exhausted). The
+post-deploy smoke run also caught and fixed a real gap: the legacy
+mixed-provider selection path (session-affinity round-robin + Bedrock failback
+credentials) invokes selectors with provider "mixed", which the claude-only
+gate rejected (`08d3fdad`).
+
 ### Rules (approved)
 
 1. **Fable reset-soonest.** For requests routed to any `claude-fable-*` model:
