@@ -60,6 +60,15 @@ func claudeQuotaRoutingFamily(model string) string {
 	}
 }
 
+// codexModelFamily reports whether the model name is a Codex-shaped model
+// (the codex provider's dynamic catalog is always gpt-*/codex-*), used when a
+// mixed-provider selector pool must route Codex traffic through the quota
+// rule.
+func codexModelFamily(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(model, "gpt") || strings.Contains(model, "codex")
+}
+
 // quotaProbeSortKey describes one credential's quota awareness for ordering:
 // exhausted removes it outright for Fable requests; reset unknown sorts last.
 type quotaProbeSortKey struct {
@@ -146,6 +155,111 @@ func quotaAwarePreferFableExhaustedForOpus(auths []*Auth, now time.Time) []*Auth
 	return exhausted
 }
 
+// ----- Codex weekly-first ordering -----
+
+// codexWeeklySortKey captures one credential's Codex allowance for the
+// "most weekly allowance left first" ordering. The 5-hour primary window is
+// a demotion flag: a credential whose hourly bucket is spent can only 429
+// until it resets, so it must never be the head pick while others have
+// hourly headroom.
+//
+// Unlike the Fable rule nothing is excluded outright: a credential whose
+// weekly subscription is spent (100%) sorts last, not "out" — accounts with
+// pay-as-you-go credits exist precisely for that state, and the locked
+// intent is "credits only after every subscription's allowance is used up".
+type codexWeeklySortKey struct {
+	auth             *Auth
+	primaryExhausted bool
+	percentKnown     bool
+	percent          float64
+}
+
+func codexWeeklySortKeyFor(auth *Auth, now time.Time) codexWeeklySortKey {
+	key := codexWeeklySortKey{auth: auth}
+	if auth == nil {
+		return key
+	}
+	key.primaryExhausted = auth.Quota.codexPrimaryExhausted(now)
+	key.percent, key.percentKnown = auth.Quota.codexWeeklyUsedPercent(now)
+	return key
+}
+
+// quotaAwareOrderForCodexWeek orders candidates so the credential with the
+// most weekly allowance left (lowest fresh used_percent) leads: hourly-exhausted
+// credentials below all others, then unknown allowances, then by weekly
+// percent ascending, then priority desc, then ID asc. Rotation happens within
+// the head group, so a credential with more spent weekly quota is only picked
+// once every better credential is unavailable or ties it exactly.
+func quotaAwareOrderForCodexWeek(auths []*Auth, now time.Time) []*Auth {
+	if len(auths) <= 1 {
+		return auths
+	}
+	keys := make([]codexWeeklySortKey, 0, len(auths))
+	for _, candidate := range auths {
+		keys = append(keys, codexWeeklySortKeyFor(candidate, now))
+	}
+	sort.SliceStable(keys, func(i, j int) bool {
+		a, b := keys[i], keys[j]
+		if a.primaryExhausted != b.primaryExhausted {
+			return !a.primaryExhausted
+		}
+		if a.percentKnown != b.percentKnown {
+			return a.percentKnown
+		}
+		if a.percentKnown && b.percentKnown && a.percent != b.percent {
+			return a.percent < b.percent
+		}
+		if pa, pb := authPriority(a.auth), authPriority(b.auth); pa != pb {
+			return pa > pb
+		}
+		return a.auth.ID < b.auth.ID
+	})
+	ordered := make([]*Auth, 0, len(keys))
+	for _, key := range keys {
+		ordered = append(ordered, key.auth)
+	}
+	return ordered
+}
+
+// quotaCodexHeadGroup returns the leading group of an ordered Codex candidate
+// list that shares the head's (primary-exhaustion, weekly percent state,
+// priority). Rotation later happens within this group so tiers with more
+// weekly spent (or a spent hourly bucket) are only entered once every
+// fresher credential leaves availability.
+func quotaCodexHeadGroup(ordered []*Auth, now time.Time) []*Auth {
+	if len(ordered) <= 1 {
+		return ordered
+	}
+	head := codexWeeklySortKeyFor(ordered[0], now)
+	headPriority := authPriority(ordered[0])
+	end := 1
+	for end < len(ordered) {
+		candidate := codexWeeklySortKeyFor(ordered[end], now)
+		if candidate.primaryExhausted != head.primaryExhausted ||
+			candidate.percentKnown != head.percentKnown ||
+			(head.percentKnown && candidate.percent != head.percent) ||
+			authPriority(candidate.auth) != headPriority {
+			break
+		}
+		end++
+	}
+	return ordered[:end]
+}
+
+// quotaHeadGroup dispatches the family-specific head group for rotation:
+// pickers rotate within the head tier rather than the full ordered list, so
+// quota ordering is a strict primary preference.
+func quotaHeadGroup(family string, ordered []*Auth, now time.Time) []*Auth {
+	switch family {
+	case "fable":
+		return quotaFableHeadGroup(ordered, now)
+	case "codex":
+		return quotaCodexHeadGroup(ordered, now)
+	default:
+		return ordered
+	}
+}
+
 // quotaFableHeadGroup returns the leading group of an ordered Fable candidate
 // list that shares the first entry's (reset, priority). Rotation later happens
 // within this group so distinct reset tiers always prefer the sooner tier.
@@ -184,25 +298,35 @@ func rotateWithinGroup(group []*Auth, lastID string) *Auth {
 }
 
 // prepareQuotaAwarePick reports the quota-routing rule family for this pick
-// and whether availability must span all priority tiers (Fable ordering is a
-// strict primary key, so it cannot work on the top tier alone).
+// and whether availability must span all priority tiers (Fable reset ordering
+// and the Codex weekly-first ordering are strict primary keys, so they cannot
+// work on the top tier alone).
 //
 // The provider gate additionally accepts "mixed": the legacy multi-provider
 // path invokes the selector with the combined candidate pool under that key,
 // and the rules are still model-shaped (probe state only ever exists on
-// Claude credentials, so non-Claude candidates sort as unknown and stay
-// reachable as failback).
+// credentials of the matching provider, so foreign candidates sort as unknown
+// and stay reachable as failback).
 func prepareQuotaAwarePick(ctx context.Context, provider, model string) (family string, acrossPriorities bool) {
 	if !quotaAwareRoutingEnabled(ctx) {
 		return "", false
 	}
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "claude", "mixed":
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	modelKey := canonicalModelKey(model)
+	switch provider {
+	case "claude":
+		family = claudeQuotaRoutingFamily(modelKey)
+	case "codex":
+		family = "codex"
+	case "mixed":
+		family = claudeQuotaRoutingFamily(modelKey)
+		if family == "" && codexModelFamily(modelKey) {
+			family = "codex"
+		}
 	default:
 		return "", false
 	}
-	family = claudeQuotaRoutingFamily(canonicalModelKey(model))
-	return family, family == "fable"
+	return family, family == "fable" || family == "codex"
 }
 
 // applyQuotaAwareCandidates narrows an available list per the rule family.
@@ -217,6 +341,10 @@ func applyQuotaAwareCandidates(family, provider, model string, auths []*Auth, no
 	switch family {
 	case "opus":
 		return quotaAwarePreferFableExhaustedForOpus(auths, now), false, nil
+	case "codex":
+		// Pure ordering: weekly-spent (credits-reliant) accounts sort last but
+		// stay reachable once every subscription account leaves availability.
+		return quotaAwareOrderForCodexWeek(auths, now), true, nil
 	case "fable":
 		ordered, allExcluded, soonest := quotaAwareOrderForFable(auths, now)
 		if allExcluded {

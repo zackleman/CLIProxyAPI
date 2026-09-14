@@ -176,8 +176,10 @@ save-cooldown-status: false
 # Codex /wham/usage) every 10 minutes per OAuth credential and use the data for
 # selection: claude-fable-* requests prefer the credential whose weekly Fable
 # quota resets soonest; claude-opus-* requests prefer credentials whose weekly
-# Fable quota is exhausted. Learned reset times are persisted as .quota sidecar
-# files next to auth files.
+# Fable quota is exhausted; Codex requests prefer the credential with the most
+# weekly (secondary window) allowance left, sinking hourly-exhausted and
+# weekly-exhausted (credits-reliant) credentials to last resort. Learned reset
+# times are persisted as .quota sidecar files next to auth files.
 # Default: false.
 quota-aware-routing: false
 

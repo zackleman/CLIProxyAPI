@@ -123,3 +123,26 @@ func (q QuotaState) claudeFableNextReset(now time.Time) time.Time {
 	}
 	return q.Probe.nextReset(QuotaWindowClaudeFable, now, fableWindowRecurrence)
 }
+
+// ----- Codex weekly routing accessors -----
+
+// codexWeeklyUsedPercent returns the credential's weekly (secondary window)
+// used percent from a fresh probe. The bool is false — and the value 0 —
+// when no fresh percent was ever observed, so "unknown" stays distinct from
+// "0% used".
+func (q QuotaState) codexWeeklyUsedPercent(now time.Time) (float64, bool) {
+	if q.Probe == nil || !q.Probe.fresh(now) {
+		return 0, false
+	}
+	window, ok := q.Probe.window(QuotaWindowCodexSecondary)
+	if !ok || window.UsedPercent == nil {
+		return 0, false
+	}
+	return *window.UsedPercent, true
+}
+
+// codexPrimaryExhausted reports whether the credential's 5-hour (primary)
+// window is spent according to a fresh probe.
+func (q QuotaState) codexPrimaryExhausted(now time.Time) bool {
+	return q.Probe.exhausted(QuotaWindowCodexPrimary, now)
+}

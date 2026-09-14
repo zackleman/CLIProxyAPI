@@ -643,7 +643,7 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 			return nil, errAware
 		}
 		if handled {
-			picked := rotateWithinGroup(quotaFableHeadGroup(candidates, now), s.lastPicked[key])
+			picked := rotateWithinGroup(quotaHeadGroup(family, candidates, now), s.lastPicked[key])
 			if picked == nil {
 				return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 			}
@@ -712,10 +712,10 @@ func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model s
 			return nil, errAware
 		}
 		if handled {
-			// Quota-sorted Fable list: weighted rotation within the head
-			// group (equal-rotation when weights match), never descending
-			// into a later-reset tier until the head group drains.
-			available = quotaFableHeadGroup(candidates, now)
+			// Quota-sorted list (Fable resets / Codex weekly): weighted
+			// rotation within the head group only, never descending into a
+			// worse tier until the head group drains.
+			available = quotaHeadGroup(family, candidates, now)
 		} else {
 			available = candidates
 		}

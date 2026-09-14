@@ -52,6 +52,24 @@ sorted head group instead of a full weighted sort; the per-auth sidecar
 extension is `.quota` (not `.quota.json`, which the auth-file watcher and token
 store would misread).
 
+### Extension (2026-09-13): Codex weekly-first ordering
+
+Second user requirement: Codex/ChatGPT subscriptions with the most weekly
+allowance left must serve first; a credits-backed account whose weekly
+subscription is spent is last resort only (live-confirmed skew: 487 vs 9
+requests landing on the credits account in one hour under plain round-robin).
+
+Rule (family `"codex"`, gated by the same `quota-aware-routing` flag, applied
+to providers `"codex"` and `"mixed"` for gpt-*/codex-* models): order ready
+candidates by fresh weekly (`secondary_window`) used_percent ascending —
+hourly(5h)-exhausted credentials demoted below all others, unknown allowances
+below known ones, then priority desc, ID asc — and rotate within the head
+group. Nothing is excluded and there is no local 429: a weekly-exhausted
+(credits-reliant) account stays eligible and only serves once every fresher
+subscription leaves availability, matching "credits only after every
+subscription allowance is used up". Ordering uses percent, not reset
+projection, so no recurrence constant is needed for Codex.
+
 ### Live verification (2026-09-13, nucbox accounts, read-only curls)
 
 - Claude `GET api.anthropic.com/api/oauth/usage` with plain

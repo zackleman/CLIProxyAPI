@@ -302,6 +302,177 @@ func TestSchedulerQuotaAwareOpus(t *testing.T) {
 	}
 }
 
+func codexAuthWithProbe(id string, priority int, weekly, primary *float64, fetchedAt time.Time) *Auth {
+	auth := &Auth{ID: id, Provider: "codex", Status: StatusActive}
+	if priority != 0 {
+		auth.Attributes = map[string]string{"priority": stringInt(priority)}
+	}
+	if weekly != nil || primary != nil {
+		windows := make(map[string]QuotaWindowState, 2)
+		if weekly != nil {
+			windows[QuotaWindowCodexSecondary] = QuotaWindowState{UsedPercent: weekly}
+		}
+		if primary != nil {
+			windows[QuotaWindowCodexPrimary] = QuotaWindowState{UsedPercent: primary}
+		}
+		auth.Quota.Probe = &QuotaProbe{FetchedAt: fetchedAt, Windows: windows}
+	}
+	return auth
+}
+
+func TestQuotaAwareOrderForCodexWeek(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	fresh := now.Add(-5 * time.Minute)
+
+	// credits-style account with a spent weekly subscription, higher priority
+	// than the subscription accounts: ordering must sink it last, not exclude it.
+	credits := codexAuthWithProbe("credits", 10, ptrFloat(100), ptrFloat(5), fresh)
+	subB := codexAuthWithProbe("sub-b", 0, ptrFloat(40), ptrFloat(5), fresh)
+	subA := codexAuthWithProbe("sub-a", 0, ptrFloat(10), ptrFloat(5), fresh)
+	unknown := codexAuthWithProbe("unknown", 0, nil, nil, time.Time{})
+
+	ordered := quotaAwareOrderForCodexWeek([]*Auth{credits, subB, unknown, subA}, now)
+	want := []string{"sub-a", "sub-b", "credits", "unknown"}
+	if len(ordered) != len(want) {
+		t.Fatalf("ordered = %v, want %v (no credential may be excluded)", ordered, want)
+	}
+	for i := range want {
+		if ordered[i].ID != want[i] {
+			t.Fatalf("ordered = %v, want %v", ordered, want)
+		}
+	}
+}
+
+func TestQuotaAwareOrderForCodexWeekPrimaryExhaustedDemotes(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	fresh := now.Add(-5 * time.Minute)
+
+	// Hourly bucket spent — picking this account only produces 429s until the
+	// 5-hour reset, so it must rank below an account with less weekly headroom.
+	spentHourly := codexAuthWithProbe("spent-hourly", 0, ptrFloat(10), ptrFloat(100), fresh)
+	healthyHourly := codexAuthWithProbe("healthy-hourly", 0, ptrFloat(90), ptrFloat(5), fresh)
+
+	ordered := quotaAwareOrderForCodexWeek([]*Auth{spentHourly, healthyHourly}, now)
+	if ordered[0].ID != "healthy-hourly" {
+		t.Fatalf("ordered = %v, want healthy-hourly first (primary window exhausted demotes)", ordered)
+	}
+}
+
+func TestQuotaAwareOrderForCodexWeekStaleProbeTreatedUnknown(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	stale := now.Add(-3 * time.Hour)
+	fresh := now.Add(-5 * time.Minute)
+
+	staleProbe := codexAuthWithProbe("stale", 0, ptrFloat(5), ptrFloat(5), stale)
+	freshProbe := codexAuthWithProbe("fresh", 0, ptrFloat(90), ptrFloat(5), fresh)
+
+	ordered := quotaAwareOrderForCodexWeek([]*Auth{staleProbe, freshProbe}, now)
+	if ordered[0].ID != "fresh" {
+		t.Fatalf("ordered = %v, want fresh first (stale percents are unknown, sort last)", ordered)
+	}
+}
+
+func TestRoundRobinSelectorQuotaAwareCodexWeeklyFirst(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	fresh := now.Add(-5 * time.Minute)
+
+	// The credits account has a spent weekly subscription but the highest
+	// priority: it must only serve after every subscription with weekly
+	// allowance left leaves availability.
+	credits := codexAuthWithProbe("credits", 10, ptrFloat(100), ptrFloat(5), fresh)
+	subA := codexAuthWithProbe("sub-a", 0, ptrFloat(30), ptrFloat(5), fresh)
+	subB := codexAuthWithProbe("sub-b", 0, ptrFloat(10), ptrFloat(5), fresh)
+	selector := &RoundRobinSelector{}
+	ctx := withQuotaAwareRouting(context.Background())
+
+	// Lowest weekly percent leads; rotation stays inside the head tier, so
+	// the credits account is never picked while a fresher subscription is ready.
+	first, err := selector.Pick(ctx, "codex", "gpt-5.5", cliproxyexecutor.Options{}, []*Auth{credits, subB, subA})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if first.ID != "sub-b" {
+		t.Fatalf("first pick = %s, want sub-b (most weekly allowance left)", first.ID)
+	}
+	for i := 0; i < 4; i++ {
+		if credits.Disabled {
+			break
+		}
+		// Simulate sub-b leaving availability: only then may credits serve.
+		subB.Disabled = true
+		subA.Disabled = true
+		picked, errPick := selector.Pick(ctx, "codex", "gpt-5.5", cliproxyexecutor.Options{}, []*Auth{credits, subB, subA})
+		if errPick != nil {
+			t.Fatalf("Pick() error = %v", errPick)
+		}
+		if picked.ID != "credits" {
+			t.Fatalf("fallback pick = %s, want credits as last resort", picked.ID)
+		}
+		break
+	}
+
+	// Flag off: priority tier wins as before.
+	picked, err := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, []*Auth{credits, subB, subA})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if picked.ID != "credits" {
+		t.Fatalf("legacy pick = %s, want credits (priority tier wins without the flag)", picked.ID)
+	}
+}
+
+func TestRoundRobinSelectorQuotaAwareCodexMixedProvider(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	fresh := now.Add(-5 * time.Minute)
+
+	home := codexAuthWithProbe("home", 0, ptrFloat(95), ptrFloat(5), fresh)
+	office := codexAuthWithProbe("office", 0, ptrFloat(35), ptrFloat(5), fresh)
+	selector := &RoundRobinSelector{}
+	ctx := withQuotaAwareRouting(context.Background())
+
+	picked, err := selector.Pick(ctx, "mixed", "gpt-5.3-codex-spark", cliproxyexecutor.Options{}, []*Auth{home, office})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if picked.ID != "office" {
+		t.Fatalf("mixed pick = %s, want office (Codex rule applies on the mixed pool)", picked.ID)
+	}
+}
+
+func TestSchedulerQuotaAwareCodex(t *testing.T) {
+	now := time.Now()
+	fresh := now.Add(-5 * time.Minute)
+
+	credits := codexAuthWithProbe("sch-credits", 10, ptrFloat(100), ptrFloat(5), fresh)
+	sub := codexAuthWithProbe("sch-sub", 0, ptrFloat(25), ptrFloat(5), fresh)
+	registerSchedulerModels(t, "codex", "gpt-5.5", "sch-credits", "sch-sub")
+	scheduler := newSchedulerForTest(&RoundRobinSelector{}, credits, sub)
+	ctx := withQuotaAwareRouting(context.Background())
+
+	picked, err := scheduler.pickSingle(ctx, "codex", "gpt-5.5", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickSingle() error = %v", err)
+	}
+	if picked == nil || picked.ID != "sch-sub" {
+		t.Fatalf("scheduler codex pick = %v, want sch-sub (weekly-first over priority)", picked)
+	}
+
+	// Legacy path keeps priority behavior without the flag.
+	legacy := newSchedulerForTest(&RoundRobinSelector{}, credits, sub)
+	picked, err = legacy.pickSingle(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickSingle() error = %v", err)
+	}
+	if picked == nil || picked.ID != "sch-credits" {
+		t.Fatalf("legacy scheduler pick = %v, want sch-credits", picked)
+	}
+}
+
 func TestQuotaPollJitterBounds(t *testing.T) {
 	t.Parallel()
 	for _, id := range []string{"", "a", "b", "claude-x@example.com"} {

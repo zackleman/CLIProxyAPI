@@ -1157,6 +1157,12 @@ func (m *modelScheduler) pickReadyLocked(ctx context.Context, preferWebsocket bo
 	if quotaAwareRoutingEnabled(ctx) && m.claudeProviderLocked() && claudeQuotaRoutingFamily(m.modelKey) == "fable" {
 		return m.pickQuotaAwareFableLocked(now, predicate)
 	}
+	// Codex weekly-first ordering is likewise a strict primary key across
+	// priorities; nothing is excluded, so a nil result just means no ready
+	// candidates at all.
+	if quotaAwareRoutingEnabled(ctx) && m.codexProviderLocked() && codexModelFamily(m.modelKey) {
+		return m.pickQuotaAwareCodexLocked(now, predicate)
+	}
 	priorityReady, okPriority := m.highestReadyPriorityLocked(preferWebsocket, predicate)
 	if !okPriority {
 		return nil
@@ -1174,14 +1180,24 @@ func (m *modelScheduler) claudeProviderLocked() bool {
 	return false
 }
 
+// codexProviderLocked reports whether the shard serves Codex credentials.
+func (m *modelScheduler) codexProviderLocked() bool {
+	for _, entry := range m.entries {
+		if entry != nil && entry.auth != nil {
+			return strings.EqualFold(strings.TrimSpace(entry.auth.Provider), "codex")
+		}
+	}
+	return false
+}
+
 // pickQuotaAwareFableLocked applies the Fable reset-soonest ordering across
 // all priority tiers: filter out credentials whose weekly Fable quota is
 // exhausted, order by soonest reset (unknown last, weekly recurrence
 // projected), rotate within the head group.
-func (m *modelScheduler) pickQuotaAwareFableLocked(now time.Time, predicate func(*scheduledAuth) bool) *Auth {
-	if m == nil {
-		return nil
-	}
+// collectReadyCandidatesLocked gathers every ready auth across all priority
+// tiers, honoring the caller predicate. Quota orderings are strict primary
+// keys, so they must see the full priority span, not just the top bucket.
+func (m *modelScheduler) collectReadyCandidatesLocked(predicate func(*scheduledAuth) bool) []*Auth {
 	candidates := make([]*Auth, 0, 4)
 	for _, priority := range m.priorityOrder {
 		bucket := m.readyByPriority[priority]
@@ -1195,14 +1211,34 @@ func (m *modelScheduler) pickQuotaAwareFableLocked(now time.Time, predicate func
 			candidates = append(candidates, entry.auth)
 		}
 	}
-	if len(candidates) == 0 {
+	return candidates
+}
+
+func (m *modelScheduler) pickQuotaAwareFableLocked(now time.Time, predicate func(*scheduledAuth) bool) *Auth {
+	if m == nil {
 		return nil
 	}
-	ordered, allExcluded, _ := quotaAwareOrderForFable(candidates, now)
+	ordered, allExcluded, _ := quotaAwareOrderForFable(m.collectReadyCandidatesLocked(predicate), now)
 	if allExcluded || len(ordered) == 0 {
 		return nil
 	}
 	picked := rotateWithinGroup(quotaFableHeadGroup(ordered, now), m.quotaLastPicked)
+	if picked != nil {
+		m.quotaLastPicked = picked.ID
+	}
+	return picked
+}
+
+// pickQuotaAwareCodexLocked applies the Codex weekly-first ordering across
+// all priority tiers: most weekly allowance left leads (hourly-exhausted and
+// unknown candidates sink), rotate within the head group. Nothing is excluded
+// — a fully spent subscription stays reachable as last resort.
+func (m *modelScheduler) pickQuotaAwareCodexLocked(now time.Time, predicate func(*scheduledAuth) bool) *Auth {
+	if m == nil {
+		return nil
+	}
+	ordered := quotaAwareOrderForCodexWeek(m.collectReadyCandidatesLocked(predicate), now)
+	picked := rotateWithinGroup(quotaCodexHeadGroup(ordered, now), m.quotaLastPicked)
 	if picked != nil {
 		m.quotaLastPicked = picked.ID
 	}
