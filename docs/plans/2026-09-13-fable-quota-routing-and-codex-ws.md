@@ -139,6 +139,31 @@ only if needed (YAGNI).
 
 ## Feature 2: decoupled Codex upstream WebSockets
 
+Status: **implemented** on branch `codex/fable-quota-aware-routing` (commit
+`b7ba9eef`): `codex.upstream-websockets` config (default off), auto-executor
+gate requiring per-credential `websockets: true`, session ids derived from the
+canonical session identity (`decws:<canonical>`), HTTP fallback + 5 min
+per-credential WS cooldown on connect/send failures (never mid-stream), 30-min
+idle eviction added to the session store (no lifecycle closes decoupled
+sessions), `UsesConfig` rebinding so reloads apply the flag.
+`scripts/bench-codex-transport.sh` replays a 12-turn full-transcript session
+with tool calls and reports wall + cached_tokens.
+
+### Bench results (2026-09-13, nucbox, spark/gpt-5.5)
+
+- gpt-5.5, 12 turns × 5 reps: HTTP 20.8s vs WS 18.9s mean wall (~9%).
+- gpt-5.3-codex-spark, 12 turns: HTTP 19.4s vs WS ~22.8s (noise-level, both
+  runs suffered one dropped turn each — upstream flakiness among mostly
+  exhausted accounts, not transport-specific).
+- cached_tokens: 0 in both transports (transcripts stay below the upstream
+  caching threshold), so parity holds trivially; connection reuse verified via
+  socket logs (one connect per session).
+- Verdict: no ≥30% win in this workload — turns are generation-bound.
+  **Config default stays off; nucbox flag left off.** The mode is one config
+  line away for real Codex CLI traffic (longer turns, session_id headers),
+  where the steady-state reuse story may differ; revisit if desired with
+  real-world traces.
+
 ### Verify first, then decouple (approved)
 
 1. Bench and validate the **existing** WS executor path (downstream WS →
