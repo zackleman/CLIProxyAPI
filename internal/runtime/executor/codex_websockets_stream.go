@@ -316,6 +316,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		for {
 			if ctx != nil && ctx.Err() != nil {
 				if sess != nil {
+					e.invalidateUpstreamConn(sess, conn, "context_done", ctx.Err())
 					sess.clearActive(conn, readCh)
 					unlockStreamSession()
 				} else {
@@ -526,10 +527,16 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	go func() {
 		terminateReason := "completed"
 		var terminateErr error
+		upstreamComplete := false
 
 		defer close(out)
 		defer func() {
 			if sess != nil {
+				// Releasing a live generation would let its remaining events reach
+				// the next request that acquires this session's socket.
+				if !upstreamComplete {
+					e.invalidateUpstreamConn(sess, conn, terminateReason, terminateErr)
+				}
 				sess.clearActive(conn, readCh)
 				unlockStreamSession()
 				return
@@ -642,6 +649,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 			eventType := gjson.GetBytes(payload, "type").String()
 			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" || eventType == "response.failed" || eventType == "error"
+			upstreamComplete = isTerminalEvent
 			if helps.HasMeaningfulCodexOutputDelta(payload) {
 				sawOutputDelta = true
 			}

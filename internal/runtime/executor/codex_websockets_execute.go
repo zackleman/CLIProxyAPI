@@ -195,9 +195,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	var readCh chan codexWebsocketRead
+	upstreamComplete := false
 	if sess != nil {
 		readCh = sess.activate(conn)
 		defer func() {
+			if !upstreamComplete {
+				e.invalidateUpstreamConn(sess, conn, "response_unfinished", err)
+			}
 			sess.clearActive(conn, readCh)
 		}()
 	}
@@ -352,6 +356,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		case "response.output_item.done":
 			collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed", "response.done", "response.incomplete":
+			upstreamComplete = true
 			if helps.IsCodexTerminalEmptyIncomplete(payload, len(outputItemsByIndex)+len(outputItemsFallback), sawOutputDelta) {
 				if sess != nil {
 					e.invalidateUpstreamConn(sess, conn, "terminal_empty_incomplete", nil)
