@@ -136,6 +136,12 @@
 // GPT are unreachable here by their 0x12 and 0x80 envelope markers; Kimi and
 // Grok have no protobuf tree.
 //
+// In EnvelopeVersion >= 4 (CAQS, e.g. claude-fable-5-1 / claude-fable-5-1-max),
+// signature bytes are located in Container Field 5 (Field 2.5), plaintext
+// model_text is omitted, and block kind supports both "thinking" and "narration".
+// The model-free parser applies the generation allowlist and carrier checks
+// before accepting this CAQS form.
+//
 // # Which provider emits which envelope
 //
 // Three providers serve Claude models, and the envelope depends on the model
@@ -826,6 +832,7 @@ func inspectClaudeCAISSignature(rawSignature string, encoding *base64.Encoding) 
 
 	var container []byte
 	var haveEnvelopeVersion bool
+	var containerSignatureBytes []byte
 	err = walkClaudeProtobufFields(decoded, func(num protowire.Number, typ protowire.Type, raw []byte) error {
 		switch num {
 		case 1:
@@ -872,6 +879,7 @@ func inspectClaudeCAISSignature(rawSignature string, encoding *base64.Encoding) 
 			}
 			haveContainerCarrier = true
 			containerCarrier = value
+			containerSignatureBytes = value
 		}
 		return nil
 	})
@@ -958,11 +966,9 @@ func inspectClaudeCAISSignature(rawSignature string, encoding *base64.Encoding) 
 		return info, nil
 	}
 
-	// Model-free CAIS has no provider literal. Require its moved carrier and both
-	// known generation identifiers, while retaining the model-tagged sibling's
-	// tolerance for incidental varint values and optional fields. The carrier is
-	// validated before the generation identifiers so malformed input never
-	// reports as an unknown generation.
+	// Model-free CAIS has no provider literal. Validate its moved carrier before
+	// checking known generation identifiers so malformed protobufs never enter
+	// the unknown-generation warning path.
 	switch {
 	case !haveEnvelopeVersion:
 		return nil, fmt.Errorf("invalid Claude model-free CAIS signature: missing envelope version")
@@ -974,6 +980,12 @@ func inspectClaudeCAISSignature(rawSignature string, encoding *base64.Encoding) 
 		return nil, &claudeCAISUnknownGenerationError{identifier: "envelope version", value: info.EnvelopeVersion}
 	case !isKnownClaudeCAISIdentifier(knownClaudeCAISChannelIDs[:], info.ChannelID):
 		return nil, &claudeCAISUnknownGenerationError{identifier: "channel_id", value: info.ChannelID}
+	}
+	if info.EnvelopeVersion >= 4 {
+		if info.BlockKind != "thinking" && info.BlockKind != "narration" {
+			return nil, fmt.Errorf("invalid Claude CAQS signature: expected block kind \"thinking\" or \"narration\", got %q", info.BlockKind)
+		}
+		info.SignatureLen = len(containerSignatureBytes)
 	}
 
 	return info, nil

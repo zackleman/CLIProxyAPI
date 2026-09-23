@@ -478,9 +478,9 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 		}
 		if reason == blockReasonCooldown {
 			cooldownCount++
-			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
-				earliest = next
-			}
+		}
+		if reason != blockReasonDisabled && next.After(now) && (earliest.IsZero() || next.Before(earliest)) {
+			earliest = next
 		}
 	}
 	return available, cooldownCount, earliest
@@ -538,7 +538,7 @@ func getAvailableAuthsWithPriorityMode(auths []*Auth, provider, model string, no
 			}
 			return nil, newModelCooldownError(model, providerForError, resetIn)
 		}
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+		return nil, newAuthUnavailableError(earliest, now)
 	}
 
 	return availableAuthsFromPriorityBuckets(availableByPriority, allPriorities), nil
@@ -884,6 +884,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	if hasUnauthorizedAuthFailure(auth) {
+		return true, blockReasonOther, time.Time{}
+	}
 	if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && !exp.After(now) {
 		return true, blockReasonOther, time.Time{}
 	}
@@ -1045,6 +1048,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	} else if opts.Metadata != nil {
 		delete(opts.Metadata, cliproxyexecutor.LCPAffinitySessionIDMetadataKey)
 		delete(opts.Metadata, cliproxyexecutor.LCPAccessGenerationMetadataKey)
+		delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+		delete(opts.Metadata, cliproxyexecutor.NodeKindMetadataKey)
 		if explicitFallbackID != "" {
 			opts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey] = cliproxysession.BoundSessionIdentity(explicitFallbackID)
 		} else {
@@ -1216,13 +1221,15 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	if len(turns) == 0 {
 		return nil, false, nil
 	}
-	fingerprints, minPrefixLength := s.matcher.Prepare(turns)
+	fingerprints, minPrefixLength, tailFingerprints, envDigest := s.matcher.PrepareExt(turns)
 	if len(fingerprints) == 0 || minPrefixLength <= 0 || minPrefixLength > len(fingerprints) {
 		return nil, false, nil
 	}
 	if opts.Metadata != nil {
 		opts.Metadata[cliproxyexecutor.LCPFingerprintMetadataKey] = fingerprints
 		opts.Metadata[cliproxyexecutor.LCPMinPrefixLengthMetadataKey] = minPrefixLength
+		opts.Metadata[cliproxyexecutor.LCPTailFingerprintsMetadataKey] = tailFingerprints
+		opts.Metadata[cliproxyexecutor.LCPEnvironmentDigestMetadataKey] = envDigest
 	}
 
 	availabilityCandidates := auths
@@ -1234,7 +1241,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 		return nil, true, errAvailable
 	}
 
-	if match, ok := s.matcher.MatchFingerprints(namespace, fingerprints, minPrefixLength); ok {
+	if match, ok := s.matcher.MatchFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength); ok {
 		for _, auth := range available {
 			if auth == nil || auth.ID != match.AuthID {
 				continue
@@ -1254,11 +1261,22 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 			if match.IsFork {
 				if opts.Metadata != nil {
 					opts.Metadata[cliproxyexecutor.IsForkMetadataKey] = true
+					delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+					opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "fork"
 				}
 				entry.Infof("session-affinity: LCP fork hit | session=%s parent=%s prefix=%d auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), truncateSessionID(match.ParentSessionID), match.PrefixLength, auth.ID, provider, model)
+			} else if match.IsCompaction {
+				if opts.Metadata != nil {
+					opts.Metadata[cliproxyexecutor.IsCompactionMetadataKey] = true
+					delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+					opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "compaction"
+				}
+				entry.Infof("session-affinity: LCP compaction hit | session=%s parent=%s prefix=%d auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), truncateSessionID(match.ParentSessionID), match.PrefixLength, auth.ID, provider, model)
 			} else {
 				if opts.Metadata != nil {
 					delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+					delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+					delete(opts.Metadata, cliproxyexecutor.NodeKindMetadataKey)
 				}
 				entry.Infof("session-affinity: LCP cache hit | session=%s prefix=%d auth=%s provider=%s model=%s", truncateSessionID(match.SessionID), match.PrefixLength, auth.ID, provider, model)
 			}
@@ -1274,7 +1292,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	if auth == nil {
 		return nil, true, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
-	if bindRes := s.matcher.BindFingerprintsWithResult(namespace, fingerprints, minPrefixLength, auth.ID); bindRes.SessionID != "" {
+	if bindRes := s.matcher.BindFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength, auth.ID); bindRes.SessionID != "" {
 		opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = bindRes.SessionID
 		opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = bindRes.SessionID
 		if bindRes.ParentSessionID != "" {
@@ -1288,11 +1306,22 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 		if bindRes.IsFork {
 			if opts.Metadata != nil {
 				opts.Metadata[cliproxyexecutor.IsForkMetadataKey] = true
+				delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+				opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "fork"
 			}
 			entry.Infof("session-affinity: LCP fork bound to new auth | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(bindRes.SessionID), truncateSessionID(bindRes.ParentSessionID), auth.ID, provider, model)
+		} else if bindRes.IsCompaction {
+			if opts.Metadata != nil {
+				opts.Metadata[cliproxyexecutor.IsCompactionMetadataKey] = true
+				delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+				opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "compaction"
+			}
+			entry.Infof("session-affinity: LCP compaction bound to new auth | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(bindRes.SessionID), truncateSessionID(bindRes.ParentSessionID), auth.ID, provider, model)
 		} else {
 			if opts.Metadata != nil {
 				delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+				delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+				delete(opts.Metadata, cliproxyexecutor.NodeKindMetadataKey)
 			}
 			entry.Infof("session-affinity: LCP cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(bindRes.SessionID), auth.ID, provider, model)
 		}
@@ -1300,14 +1329,48 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	return auth, true, nil
 }
 
-func lcpAffinityNamespace(provider, model string, metadata map[string]any) string {
+func canonicalLCPProvider(provider string) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
+	switch provider {
+	case "google", "gemini", "vertex", "aistudio":
+		return "google"
+	case "codex", "openai":
+		return "openai"
+	case "claude", "anthropic":
+		return "claude"
+	case "devin":
+		return "devin"
+	default:
+		return provider
+	}
+}
+
+func lcpAffinityNamespace(provider, model string, metadata map[string]any) string {
+	provider = canonicalLCPProvider(provider)
 	model = canonicalModelKey(model)
 	callerScope := sessionMetadataString(metadata, cliproxyexecutor.CallerScopeMetadataKey)
 	if provider == "" || callerScope == "" {
 		return ""
 	}
 	return strings.Join([]string{"lcp:v1", provider, model, callerScope}, "::")
+}
+
+func parseLCPNamespace(ns string) (provider, model, callerScope string, ok bool) {
+	if !strings.HasPrefix(ns, "lcp:v1::") {
+		return "", "", "", false
+	}
+	rest := strings.TrimPrefix(ns, "lcp:v1::")
+	nsProvider, rest, found := strings.Cut(rest, "::")
+	if !found {
+		return "", "", "", false
+	}
+	lastIdx := strings.LastIndex(rest, "::")
+	if lastIdx < 0 {
+		return nsProvider, rest, "", true
+	}
+	nsModel := rest[:lastIdx]
+	nsCallerScope := rest[lastIdx+2:]
+	return nsProvider, nsModel, nsCallerScope, true
 }
 
 func lcpFingerprintsFromMetadata(metadata map[string]any) ([]string, int) {
@@ -1389,6 +1452,106 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	}
 }
 
+// LookupAffinity observes the current session affinity binding without side effects.
+// It never selects a credential, creates a binding, rebinds, or refreshes TTL.
+// Optional authFilters allow callers (such as Manager) to exclude credentials that do not match the requested provider.
+func (s *SessionAffinitySelector) LookupAffinity(provider, model, sessionID string, authFilters ...func(authID string) bool) (string, string) {
+	if s == nil || s.cache == nil {
+		return "", "unsupported"
+	}
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	sessionID = strings.TrimSpace(sessionID)
+	if provider == "" || model == "" || sessionID == "" {
+		return "", "unbound"
+	}
+
+	var authFilter func(authID string) bool
+	if len(authFilters) > 0 {
+		authFilter = authFilters[0]
+	}
+
+	modelKey := canonicalModelKey(model)
+	if modelKey == "" {
+		modelKey = model
+	}
+
+	providers := []string{provider}
+	if provider != "mixed" {
+		providers = append(providers, "mixed")
+	}
+
+	candidatePrefixes := cliproxysession.CandidateSessionPrefixes
+	hasKnownPrefix := false
+	for _, p := range candidatePrefixes {
+		if strings.HasPrefix(sessionID, p) {
+			hasKnownPrefix = true
+			break
+		}
+	}
+
+	var candidates []string
+	if hasKnownPrefix {
+		candidates = []string{sessionID}
+	} else {
+		candidates = make([]string, 0, len(candidatePrefixes)+1)
+		candidates = append(candidates, sessionID)
+		for _, p := range candidatePrefixes {
+			candidates = append(candidates, p+sessionID)
+		}
+	}
+
+	foundAuths := make(map[string]struct{})
+	for _, candProvider := range providers {
+		for _, cand := range candidates {
+			bounded := cliproxysession.BoundSessionIdentity(cand)
+			key := candProvider + "::" + bounded + "::" + modelKey
+			if authID, ok := s.cache.Get(key); ok && authID != "" {
+				if authFilter != nil && !authFilter(authID) {
+					continue
+				}
+				foundAuths[authID] = struct{}{}
+			}
+		}
+	}
+
+	if s.matcher != nil {
+		for _, cand := range candidates {
+			if authIDs, ns, ok := s.matcher.LookupSession(cand); ok && len(authIDs) > 0 {
+				nsProvider, nsModel, _, okParse := parseLCPNamespace(ns)
+				matchesNS := true
+				if okParse {
+					reqProvider := canonicalLCPProvider(provider)
+					canonicalNSProvider := canonicalLCPProvider(nsProvider)
+					if (provider != "mixed" && nsProvider != "mixed" && canonicalNSProvider != reqProvider) ||
+						(modelKey != "" && nsModel != modelKey) {
+						matchesNS = false
+					}
+				}
+				if matchesNS {
+					for _, aID := range authIDs {
+						if authFilter != nil && !authFilter(aID) {
+							continue
+						}
+						foundAuths[aID] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+
+	if len(foundAuths) == 0 {
+		return "", "unbound"
+	}
+	if len(foundAuths) > 1 {
+		return "", "ambiguous"
+	}
+	for authID := range foundAuths {
+		return authID, "bound"
+	}
+	return "", "unbound"
+}
+
 // OnResult handles session affinity binding or release based on execution outcome.
 func (s *SessionAffinitySelector) OnResult(res Result) {
 	if s == nil || res.AuthID == "" {
@@ -1423,13 +1586,15 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	if explicitID == "" && s.matcher != nil {
 		if namespace := lcpAffinityNamespace(ns, nsModel, res.Options.Metadata); namespace != "" {
 			fingerprints, minPrefixLength := lcpFingerprintsFromMetadata(res.Options.Metadata)
+			tailFingerprints, _ := res.Options.Metadata[cliproxyexecutor.LCPTailFingerprintsMetadataKey].([]string)
+			envDigest, _ := res.Options.Metadata[cliproxyexecutor.LCPEnvironmentDigestMetadataKey].(string)
 			if len(fingerprints) == 0 {
 				turns := cliproxysession.ExtractCanonicalTurns(res.Options.SourceFormat, res.Options.OriginalRequest)
-				fingerprints, minPrefixLength = s.matcher.Prepare(turns)
+				fingerprints, minPrefixLength, tailFingerprints, envDigest = s.matcher.PrepareExt(turns)
 			}
 			if len(fingerprints) > 0 && minPrefixLength > 0 && minPrefixLength <= len(fingerprints) {
 				if res.Success {
-					s.matcher.TouchFingerprints(namespace, fingerprints, minPrefixLength, res.AuthID)
+					s.matcher.TouchFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength, res.AuthID)
 				} else {
 					var generation uint64
 					if res.Options.Metadata != nil {
