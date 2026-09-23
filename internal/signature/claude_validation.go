@@ -653,12 +653,12 @@ const (
 // independently observed CAIS generations and the complete model-free spine is
 // present. When Anthropic
 // adds a generation, confirm its complete protobuf tree against captures, then
-// add its envelope version or channel id here. Channel id 11 is intentionally
-// absent because it has only been observed under the legacy 0x12 envelope, never
-// under CAIS.
+// add its envelope version or channel id here. Channel ids 16, 17, and 18 are
+// observed in CAIS traffic. Channel id 11 is intentionally absent because it
+// has only been observed under the legacy 0x12 envelope, never under CAIS.
 var (
 	knownClaudeCAISEnvelopeVersions = [...]uint64{2, 4}
-	knownClaudeCAISChannelIDs       = [...]uint64{16, 17}
+	knownClaudeCAISChannelIDs       = [...]uint64{16, 17, 18}
 )
 
 type claudeCAISUnknownGenerationError struct {

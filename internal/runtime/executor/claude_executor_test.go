@@ -3398,7 +3398,7 @@ func TestClaudeExecutor_ExecuteWarnsForUnknownCAISGenerationAtDefaultInfo(t *tes
 	}
 
 	const unknownEnvelopeReason = "invalid Claude model-free CAIS signature: unknown envelope version 5"
-	const unknownChannelReason = "invalid Claude model-free CAIS signature: unknown channel_id 18"
+	const unknownChannelReason = "invalid Claude model-free CAIS signature: unknown channel_id 19"
 	t.Run("sole unknown generation is visible at default info", func(t *testing.T) {
 		signature := modelFreeClaudeCAISSignatureForExecutorTest(5, 17)
 		payload := []byte(`{"model":"claude-fable-5-1","max_tokens":16,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"signed history","signature":"` + signature + `"},{"type":"text","text":"answer"}]},{"role":"user","content":[{"type":"text","text":"next"}]}]}`)
@@ -3412,7 +3412,7 @@ func TestClaudeExecutor_ExecuteWarnsForUnknownCAISGenerationAtDefaultInfo(t *tes
 	t.Run("later unknown generations are aggregated at default info", func(t *testing.T) {
 		recognized := modelFreeClaudeCAISSignatureForExecutorTest(4, 17)
 		unknownEnvelope := modelFreeClaudeCAISSignatureForExecutorTest(5, 17)
-		unknownChannel := modelFreeClaudeCAISSignatureForExecutorTest(4, 18)
+		unknownChannel := modelFreeClaudeCAISSignatureForExecutorTest(4, 19)
 		payload := []byte(`{"model":"claude-fable-5-1","max_tokens":16,"messages":[` +
 			`{"role":"assistant","content":[{"type":"thinking","thinking":"recognized","signature":"` + recognized + `"},{"type":"text","text":"answer 0"}]},` +
 			`{"role":"user","content":[{"type":"text","text":"next 0"}]},` +
@@ -3531,7 +3531,7 @@ func TestLogClaudeSignatureSanitizeReport_FiltersNonDropDecisionsBeforeClassifyi
 	})
 
 	const realDropReason = "invalid Claude model-free CAIS signature: unknown envelope version 5"
-	const notADropReason = "invalid Claude model-free CAIS signature: unknown channel_id 18"
+	const notADropReason = "invalid Claude model-free CAIS signature: unknown channel_id 19"
 
 	report := sigcompat.SignatureSanitizeReport{
 		TargetProvider: sigcompat.SignatureProviderClaude,
