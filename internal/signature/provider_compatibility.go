@@ -152,72 +152,51 @@ func DetectSignatureProvider(rawSignature string) SignatureProvider {
 	return DetectSignatureProviderForBlock(rawSignature, SignatureBlockKindUnknown)
 }
 
-type signatureProviderDetection struct {
-	provider        SignatureProvider
-	rejectionReason string
-}
-
-func unknownSignatureProviderDetection(reason string) signatureProviderDetection {
-	return signatureProviderDetection{
-		provider:        SignatureProviderUnknown,
-		rejectionReason: reason,
-	}
-}
-
 // DetectSignatureProviderForBlock classifies rawSignature with block-kind
 // context. UUID-shaped payloads are deliberately not classified as replay-safe
 // provider signatures; callers targeting Gemini should replace them with the
 // bypass sentinel.
 func DetectSignatureProviderForBlock(rawSignature string, blockKind SignatureBlockKind) SignatureProvider {
-	return detectSignatureProviderForBlock(rawSignature, blockKind).provider
-}
-
-func detectSignatureProviderForBlock(rawSignature string, blockKind SignatureBlockKind) signatureProviderDetection {
 	sig := strings.TrimSpace(rawSignature)
 	if sig == "" {
-		return unknownSignatureProviderDetection("")
+		return SignatureProviderUnknown
 	}
 
 	if prefixedProvider, unprefixed, ok := SplitSignatureProviderPrefix(sig); ok {
 		switch prefixedProvider {
 		case SignatureProviderGemini:
 			if IsGeminiThoughtSignatureBypass(unprefixed) {
-				return signatureProviderDetection{provider: SignatureProviderGeminiBypass}
+				return SignatureProviderGeminiBypass
 			}
 			if isRecognizedGeminiProviderSignature(unprefixed, blockKind) {
-				return signatureProviderDetection{provider: SignatureProviderGemini}
+				return SignatureProviderGemini
 			}
 		case SignatureProviderClaude:
-			if IsValidClaudeThinkingSignature(unprefixed, ClaudeSignatureValidationOptions{Strict: true}) {
-				return signatureProviderDetection{provider: SignatureProviderClaude}
-			}
-			if _, err := InspectClaudeCAISSignature(unprefixed); err == nil {
-				return signatureProviderDetection{provider: SignatureProviderClaude}
-			} else if reason := claudeCAISUnknownGenerationReason(err); reason != "" {
-				return unknownSignatureProviderDetection(reason)
+			if IsValidClaudeThinkingSignature(unprefixed, ClaudeSignatureValidationOptions{Strict: true}) || IsValidClaudeCAISSignature(unprefixed) {
+				return SignatureProviderClaude
 			}
 		case SignatureProviderGPT:
 			if IsValidGPTReasoningSignature(unprefixed) {
-				return signatureProviderDetection{provider: SignatureProviderGPT}
+				return SignatureProviderGPT
 			}
 		case SignatureProviderSWE:
 			if strings.HasPrefix(unprefixed, "sealed.v1.") {
-				return signatureProviderDetection{provider: SignatureProviderSWE}
+				return SignatureProviderSWE
 			}
 		}
-		return unknownSignatureProviderDetection("")
+		return SignatureProviderUnknown
 	}
 	if strings.Contains(sig, "#") {
-		return unknownSignatureProviderDetection("")
+		return SignatureProviderUnknown
 	}
 
 	// The bypass sentinel is a plain literal rather than an envelope, so it must
 	// be matched before the structural pre-filter below rejects it.
 	if IsGeminiThoughtSignatureBypass(sig) {
-		return signatureProviderDetection{provider: SignatureProviderGeminiBypass}
+		return SignatureProviderGeminiBypass
 	}
 	if strings.HasPrefix(sig, "sealed.v1.") {
-		return signatureProviderDetection{provider: SignatureProviderSWE}
+		return SignatureProviderSWE
 	}
 	// Probes run from the strongest marker to the weakest:
 	//   1. GPT carries the literal "gAAAA" prefix, which pins both the version
@@ -239,28 +218,19 @@ func detectSignatureProviderForBlock(rawSignature string, blockKind SignatureBlo
 	// early, because Kimi's uniformly distributed base64 starts with one of
 	// "CERg" about 6% of the time and would otherwise be dropped by whichever
 	// side of the gate it happened to land on.
-	var claudeRejectionReason string
 	if maybeSelfDescribingSignatureEnvelope(sig) {
 		if IsValidGPTReasoningSignature(sig) {
-			return signatureProviderDetection{provider: SignatureProviderGPT}
+			return SignatureProviderGPT
 		}
-		if _, err := InspectClaudeCAISSignature(sig); err == nil {
-			return signatureProviderDetection{provider: SignatureProviderClaude}
-		} else {
-			claudeRejectionReason = claudeCAISUnknownGenerationReason(err)
+		if IsValidClaudeCAISSignature(sig) {
+			return SignatureProviderClaude
 		}
 		if IsValidClaudeThinkingSignature(sig, ClaudeSignatureValidationOptions{Strict: true}) {
-			return signatureProviderDetection{provider: SignatureProviderClaude}
+			return SignatureProviderClaude
 		}
 		if isRecognizedGeminiProviderSignature(sig, blockKind) {
-			return signatureProviderDetection{provider: SignatureProviderGemini}
+			return SignatureProviderGemini
 		}
-	}
-	// A complete model-free CAIS tree with a new generation identifier is stronger
-	// evidence than Kimi's residual length match. Keep it unclassified but retain
-	// its precise rejection so callers can surface the stale known-set diagnosis.
-	if claudeRejectionReason != "" {
-		return unknownSignatureProviderDetection(claudeRejectionReason)
 	}
 	// Kimi carries no envelope, so it can only be claimed once every
 	// self-describing probe above has declined. Ordering it last means a length
@@ -268,9 +238,9 @@ func detectSignatureProviderForBlock(rawSignature string, blockKind SignatureBlo
 	// drift in Kimi's sizes costs Kimi its own identification rather than
 	// corrupting a neighbouring family.
 	if IsValidKimiThinkingSignature(sig) {
-		return signatureProviderDetection{provider: SignatureProviderKimi}
+		return SignatureProviderKimi
 	}
-	return unknownSignatureProviderDetection("")
+	return SignatureProviderUnknown
 }
 
 func IsSignatureCompatibleWithProvider(targetProvider SignatureProvider, rawSignature string) bool {
@@ -292,8 +262,7 @@ func DecideSignatureCompatibilityForModel(targetProvider SignatureProvider, targ
 		blockKind = SignatureBlockKindUnknown
 	}
 
-	detection := detectSignatureProviderForBlock(rawSignature, blockKind)
-	detected := detection.provider
+	detected := DetectSignatureProviderForBlock(rawSignature, blockKind)
 	decision := SignatureCompatibilityDecision{
 		TargetProvider:   targetProvider,
 		DetectedProvider: detected,
@@ -321,11 +290,7 @@ func DecideSignatureCompatibilityForModel(targetProvider SignatureProvider, targ
 		decision.Reason = "signature is not compatible with Gemini and this block is not a bypass-safe Gemini model part"
 	case SignatureProviderClaude:
 		decision.Action = SignatureActionDropBlock
-		if detection.rejectionReason != "" {
-			decision.Reason = detection.rejectionReason
-		} else {
-			decision.Reason = "Claude has no cross-provider bypass sentinel for thinking blocks"
-		}
+		decision.Reason = "Claude has no cross-provider bypass sentinel for thinking blocks"
 	case SignatureProviderGPT:
 		decision.Action = SignatureActionDropBlock
 		decision.Reason = "GPT reasoning encrypted_content cannot be synthesized from another provider signature"
@@ -431,8 +396,9 @@ func CompatibleAntigravityClaudeThinkingSignature(rawSignature string) (string, 
 }
 
 // claudeCompatibleSignatureReason explains why a matching signature is
-// replayable. Model-tagged CAIS signatures report their issuing model;
-// model-free CAIS signatures report their structural classification.
+// replayable. Claude CAIS signatures carry the issuing model inside the payload,
+// so the embedded model and the target model are both reported to make signature
+// decisions traceable in debug logs.
 func claudeCompatibleSignatureReason(targetProvider SignatureProvider, rawSignature, targetModel string) string {
 	const genericReason = "signature provider matches target provider"
 	if targetProvider != SignatureProviderClaude {
@@ -448,7 +414,7 @@ func claudeCompatibleSignatureReason(targetProvider SignatureProvider, rawSignat
 	} else if info.EnvelopeVersion >= 4 {
 		reason = "valid Claude CAQS signature is compatible with any Claude target"
 	} else {
-		reason = "valid Claude model-free CAIS thinking signature is compatible with any Claude target"
+		reason = "valid Claude CAIS signature is compatible with any Claude target"
 	}
 	if trimmedModel := strings.TrimSpace(targetModel); trimmedModel != "" {
 		reason += ", including target model " + trimmedModel
